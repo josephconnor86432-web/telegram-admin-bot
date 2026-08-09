@@ -1,2 +1,2 @@
-# telegram-admin-bot_v2
+# telegram-admin-bot
 ربات مدیریت گروه
