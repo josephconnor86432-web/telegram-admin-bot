@@ -7,13 +7,13 @@ from functools import wraps
 from contextlib import contextmanager
 
 import psycopg2
-from psycopg2.pool import ThreadedConnectionPool
+from psycopg2 import pool
 from flask import Flask, request, session, redirect, url_for, render_template_string, jsonify
 import telebot
 from telebot import types
 
 # ---------------------------------------------------------
-# تنظیمات و متغیرهای محیطی
+# تنظیمات لاگینگ و متغیرهای محیطی
 # ---------------------------------------------------------
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -24,28 +24,40 @@ PANEL_PASSWORD = os.environ.get('PANEL_PASSWORD', 'admin123')
 FLASK_SECRET_KEY = os.environ.get('FLASK_SECRET_KEY', os.urandom(24).hex())
 CRON_SECRET = os.environ.get('CRON_SECRET', 'cron_secure_token')
 
-# تنظیمات پیش‌فرض ضد خرابکاری (Anti-Raid Defaults)
-DEFAULT_MASS_BAN_THRESHOLD = 5         # تعداد بن مجاز در بازه زمانی
-DEFAULT_MASS_RESTRICT_THRESHOLD = 8    # تعداد محدودسازی مجاز
-DEFAULT_WINDOW_MINUTES = 5             # بازه زمانی (دقیقه)
-DEFAULT_INACTIVITY_DAYS = 30           # آستانه خواب مالک (روز)
-
 WARNING_MESSAGE = """⚠️ <b>هشدار امنیتی ربات نظارت:</b>
 مالک این گروه برای مدت طولانی هیچ فعالیتی نداشته است.
-در صورتی که مالک ظرف ۲۴ ساعت آینده پیامی در گروه ارسال نکند، تمامی ادمین‌های غیرمحافظت‌شده به منظور حفظ امنیت گروه عزل خواهند شد."""
+در صورتی که مالک ظرف ۲۴ ساعت آینده پیامی در گروه ارسال نکند، ادمین‌های غیرمحافظت‌شده به صورت خودکار عزل خواهند شد."""
 
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False, parse_mode='HTML')
 app = Flask(__name__)
 app.secret_key = FLASK_SECRET_KEY
 
 # ---------------------------------------------------------
-# اتصال پایگاه داده و Connection Pool
+# مدیریت پایگاه داده با سازگاری Serverless (Vercel)
 # ---------------------------------------------------------
-db_pool = ThreadedConnectionPool(1, 20, DATABASE_URL, sslmode='require')
+def create_pool():
+    return pool.ThreadedConnectionPool(1, 10, DATABASE_URL, sslmode='require')
+
+db_pool = create_pool()
 
 @contextmanager
 def get_db():
-    conn = db_pool.getconn()
+    global db_pool
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        # تست زنده بودن اتصال (مخصوص سرورلس برای جلوگیری از Stale Connection)
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+    except Exception:
+        if conn:
+            try:
+                db_pool.putconn(conn, close=True)
+            except Exception:
+                pass
+        db_pool = create_pool()
+        conn = db_pool.getconn()
+
     try:
         yield conn
         conn.commit()
@@ -54,10 +66,11 @@ def get_db():
         logging.error(f"Database Error: {e}")
         raise
     finally:
-        db_pool.putconn(conn)
+        if conn:
+            db_pool.putconn(conn)
 
 def init_db():
-    """ساخت خودکار جداول دیتابیس در صورت عدم وجود"""
+    """ساخت جداول پایگاه داده در صورت عدم وجود"""
     with get_db() as conn:
         with conn.cursor() as c:
             c.execute("""
@@ -117,10 +130,13 @@ def init_db():
             );
             """)
 
-init_db()
+try:
+    init_db()
+except Exception as e:
+    logging.error(f"Failed to init DB: {e}")
 
 # ---------------------------------------------------------
-# توابع کار با دیتابیس
+# توابع کمکی دیتابیس
 # ---------------------------------------------------------
 def add_or_update_group(chat_id, title, owner_id, chat_type, threshold=30):
     now = int(time.time())
@@ -149,7 +165,7 @@ def get_group(chat_id):
 def get_all_groups():
     with get_db() as conn:
         with conn.cursor() as c:
-            c.execute("SELECT chat_id, chat_title, owner_id, threshold_days, last_owner_activity, chat_type, strict_promote_lock FROM groups ORDER BY chat_id")
+            c.execute("SELECT chat_id, chat_title, owner_id, threshold_days, last_owner_activity, chat_type, strict_promote_lock, ban_threshold, restrict_threshold, window_minutes FROM groups ORDER BY chat_title")
             return c.fetchall()
 
 def update_group_settings(chat_id, threshold_days, strict_promote_lock, ban_threshold, restrict_threshold, window_minutes):
@@ -186,7 +202,7 @@ def log_action(chat_id, action, actor_id, target_id, details=""):
                 VALUES (%s, %s, %s, %s, %s, %s)
             """, (chat_id, action, actor_id, target_id, details, int(time.time())))
 
-def get_action_log(chat_id, limit=40):
+def get_action_log(chat_id, limit=30):
     with get_db() as conn:
         with conn.cursor() as c:
             c.execute("""
@@ -263,7 +279,7 @@ def clear_pending_warning(chat_id):
 # توابع مدیریتی ربات تلگرام
 # ---------------------------------------------------------
 def get_group_owner(chat_id):
-    """یافتن مالک اصلی و سازنده گروه به صورت داینامیک از تلگرام"""
+    """یافتن مالک گروه از تلگرام"""
     try:
         admins = bot.get_chat_administrators(chat_id)
         for a in admins:
@@ -274,7 +290,7 @@ def get_group_owner(chat_id):
     return None
 
 def demote_admin(chat_id, admin_id):
-    """خلع ید و سلب تمام دسترسی‌های مدیریتی یک ادمین در تلگرام"""
+    """سلب تمام دسترسی‌های ادمین خاطی"""
     try:
         bot.promote_chat_member(
             chat_id, admin_id,
@@ -295,35 +311,33 @@ def demote_admin(chat_id, admin_id):
         )
         return True
     except Exception as e:
-        logging.error(f"Failed to demote {admin_id} in {chat_id}: {e}")
-        # در صورت شکست، روش جایگزین کیک و آن‌بن کردن برای حذف کامل از لیست ادمین‌ها
+        logging.error(f"Demote failed: {e}")
         try:
             bot.ban_chat_member(chat_id, admin_id)
             bot.unban_chat_member(chat_id, admin_id)
             return True
-        except Exception as e2:
-            logging.error(f"Fallback kick also failed: {e2}")
+        except Exception:
             return False
 
 def notify_super_admin(chat_id, admin_id, group_title, reason, flag_id, auto_demoted=False):
-    """ارسال اعلان آنی و فوری به سوپر ادمین"""
+    """ارسال اعلان آنی به سوپرادمین"""
     try:
         info = bot.get_chat_member(chat_id, admin_id).user
-        name = info.first_name or "نامشخص"
+        name = info.first_name or "ناشناس"
         username = f"@{info.username}" if info.username else "ندارد"
     except Exception:
         name = "ناشناس"
         username = "ندارد"
 
-    status_str = "🔴 <b>ادمین به صورت خودکار عزل شد!</b>" if auto_demoted else "⚠️ <b>نیاز به اقدام سوپرادمین:</b>"
+    status_str = "🔴 <b>ادمین به صورت خودکار عزل شد!</b>" if auto_demoted else "⚠️ <b>اقدام مورد نیاز سوپرادمین:</b>"
 
     text = (
-        f"🚨 <b>هشدار امنیتی در گروه!</b>\n\n"
+        f"🚨 <b>هشدار امنیتی!</b>\n\n"
         f"{status_str}\n"
         f"📍 <b>گروه:</b> {html.escape(str(group_title))}\n"
-        f"👤 <b>ادمین:</b> {html.escape(name)} ({username})\n"
-        f"🆔 <b>آیدی عددی:</b> <code>{admin_id}</code>\n"
-        f"💬 <b>علت گزارش:</b> {html.escape(reason)}\n"
+        f"👤 <b>ادمین خاطی:</b> {html.escape(name)} ({username})\n"
+        f"🆔 <b>شناسه عددی:</b> <code>{admin_id}</code>\n"
+        f"💬 <b>علت:</b> {html.escape(reason)}\n"
         f"⏰ <b>زمان:</b> {time.strftime('%Y-%m-%d %H:%M:%S')}"
     )
 
@@ -335,191 +349,334 @@ def notify_super_admin(chat_id, admin_id, group_title, reason, flag_id, auto_dem
         )
     else:
         markup.add(
-            types.InlineKeyboardButton("🛡 افزودن به لیست مصون", callback_data=f"protect_{chat_id}_{admin_id}_{flag_id}"),
+            types.InlineKeyboardButton("🛡 افزودن به لیست سفید", callback_data=f"protect_{chat_id}_{admin_id}_{flag_id}"),
             types.InlineKeyboardButton("✅ تأیید", callback_data=f"ign_{flag_id}")
         )
 
     try:
         bot.send_message(SUPER_ADMIN_ID, text, reply_markup=markup)
     except Exception as e:
-        logging.error(f"Error notifying super admin: {e}")
+        logging.error(f"Failed to notify super admin: {e}")
 
 # ---------------------------------------------------------
-# هندلرهای ربات تلگرام
+# منوی شیشه‌ای پیشرفته مخصوص پی‌وی (PV Menu Builders)
 # ---------------------------------------------------------
-@bot.message_handler(commands=['start', 'help'])
-def cmd_start(message):
-    text = (
-        "🤖 <b>ربات پیشرفته مدیریت و حفاظت از ادمین‌های گروه</b>\n\n"
-        "<b>دستورات مدیر کل:</b>\n"
-        "▫️ <code>/register</code> - ثبت گروه و شناسایی خودکار مالک\n"
-        "▫️ <code>/protect_admin &lt;ID&gt;</code> - افزودن ادمین به لیست سفید (مصون از حذف)\n"
-        "▫️ <code>/unprotect_admin &lt;ID&gt;</code> - حذف از لیست سفید\n"
-        "▫️ <code>/remove_admin &lt;ID&gt;</code> - عزل فوری یک ادمین\n"
-        "▫️ <code>/set_threshold &lt;Days&gt;</code> - تنظیم روزهای خواب مجاز مالک\n"
-        "▫️ <code>/status</code> - وضعیت امنیتی و ادمین‌های گروه\n\n"
-        "<b>دستورات عمومی:</b>\n"
-        "▫️ <code>/report_admin &lt;علت&gt;</code> (ریپلای روی پیام ادمین خاطی)"
+def get_pv_main_menu():
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton("👥 افراد و ادمین‌های تحت پایش", callback_data="pv_monitored_groups"),
+        types.InlineKeyboardButton("📋 لیست تمام گروه‌ها و وضعیت مالک", callback_data="pv_list_groups"),
+        types.InlineKeyboardButton("🚨 هشدارهای فعال و گزارش‌ها", callback_data="pv_active_flags"),
+        types.InlineKeyboardButton("🔄 بروزرسانی", callback_data="pv_refresh_main")
     )
-    bot.reply_to(message, text)
+    return markup
+
+def get_pv_group_detail_markup(chat_id):
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("👥 مشاهده ادمین‌های این گروه", callback_data=f"pv_admins_{chat_id}"),
+        types.InlineKeyboardButton("🛡 ادمین‌های محافظت‌شده", callback_data=f"pv_protected_{chat_id}")
+    )
+    markup.add(
+        types.InlineKeyboardButton("📜 مشاهده لاگ‌ها", callback_data=f"pv_logs_{chat_id}"),
+        types.InlineKeyboardButton("🔒 تغییر قفل ارتقا", callback_data=f"pv_toggle_lock_{chat_id}")
+    )
+    markup.add(
+        types.InlineKeyboardButton("🔙 بازگشت به لیست گروه‌ها", callback_data="pv_monitored_groups")
+    )
+    return markup
+
+# ---------------------------------------------------------
+# هندلرهای پیام‌های ربات تلگرام
+# ---------------------------------------------------------
+@bot.message_handler(commands=['start', 'panel', 'menu'])
+def cmd_start(message):
+    if message.from_user.id != SUPER_ADMIN_ID:
+        bot.reply_to(message, "⛔️ این ربات اختصاصی است و فقط به سوپرادمین پاسخ می‌دهد.")
+        return
+
+    if message.chat.type == 'private':
+        text = (
+            "👑 <b>پنل کنترل و پایش مرکزی ربات (مخصوص پی‌وی)</b>\n\n"
+            "از منوی زیر می‌توانید وضعیت تمام گروه‌ها، ادمین‌های تحت نظارت و هشدارهای امنیتی را بررسی و مدیریت کنید:"
+        )
+        bot.send_message(message.chat.id, text, reply_markup=get_pv_main_menu())
+    else:
+        text = (
+            "🤖 <b>ربات نظارت و امنیت گروه</b>\n\n"
+            "▫️ <code>/register</code> - ثبت این گروه\n"
+            "▫️ <code>/protect_admin &lt;ID&gt;</code> - محافظت از ادمین\n"
+            "▫️ <code>/unprotect_admin &lt;ID&gt;</code> - لغو محافظت\n"
+            "▫️ <code>/remove_admin &lt;ID&gt;</code> - عزل دستی ادمین\n"
+            "▫️ <code>/status</code> - وضعیت امنیتی گروه\n\n"
+            "💡 <i>برای مدیریت پیشرفته و کنترل تمام گروه‌ها به پی‌وی ربات مراجعه فرمایید.</i>"
+        )
+        bot.reply_to(message, text)
+
+@bot.message_handler(commands=['monitored', 'monitored_list', 'list_admins', 'admins'])
+def cmd_monitored_list(message):
+    """دستور لیست افراد و ادمین‌های تحت پایش (هم در پی‌وی و هم در گروه)"""
+    if message.from_user.id != SUPER_ADMIN_ID:
+        return
+
+    groups = get_all_groups()
+    if not groups:
+        bot.reply_to(message, "❌ هنوز هیچ گروهی در سیستم ثبت نشده است. ابتدا ربات را با دستور <code>/register</code> در گروه ثبت کنید.")
+        return
+
+    # اگر کاربر آیدی یک گروه را به عنوان آرگومان داده باشد
+    target_chat_id = None
+    parts = message.text.split()
+    if len(parts) > 1:
+        try:
+            target_chat_id = int(parts[1])
+        except ValueError:
+            pass
+    elif message.chat.type in ['group', 'supergroup']:
+        target_chat_id = message.chat.id
+
+    if target_chat_id:
+        # نمایش لیست ادمین‌های یک گروه مشخص
+        g = get_group(target_chat_id)
+        if not g:
+            bot.reply_to(message, f"❌ گروهی با شناسه <code>{target_chat_id}</code> پیدا نشد.")
+            return
+        
+        protected = get_protected_admins(target_chat_id)
+        owner_id = g[2]
+        now = int(time.time())
+        days_inactive = int((now - g[4]) / 86400)
+
+        try:
+            tg_admins = bot.get_chat_administrators(target_chat_id)
+        except Exception as e:
+            bot.reply_to(message, f"❌ خطا در دریافت ادمین‌ها از تلگرام: {e}")
+            return
+
+        bot_id = bot.get_me().id
+        text = (
+            f"👥 <b>لیست افراد تحت پایش گروه: {html.escape(g[1])}</b>\n"
+            f"🆔 <code>{g[0]}</code> | 👑 مالک: <code>{owner_id}</code>\n"
+            f"⏳ آخرین فعالیت مالک: <b>{days_inactive} روز پیش</b> (آستانه: {g[3]} روز)\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        )
+
+        for a in tg_admins:
+            u = a.user
+            if u.id == bot_id:
+                continue
+            name = html.escape(u.first_name or "ناشناس")
+            
+            if a.status == 'creator':
+                role = "👑 <b>مالک اصلی</b>"
+            elif u.id in protected:
+                role = "🛡 <b>محافظت‌شده (لیست سفید)</b>"
+            else:
+                role = "⚠️ <b>تحت نظارت و آسیب‌پذیر</b>"
+
+            text += f"▫️ {name} (<code>{u.id}</code>)\n   نقش: {role}\n\n"
+
+        if message.chat.type == 'private':
+            bot.send_message(message.chat.id, text, reply_markup=get_pv_group_detail_markup(target_chat_id))
+        else:
+            bot.reply_to(message, text)
+        return
+
+    # اگر در پی‌وی بدون آرگومان صدا زده شد: لیست تمام گروه‌ها با دکمه برای بررسی سریع
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    text = "📋 <b>لیست گروه‌های تحت نظارت و پایش:</b>\nبرای مشاهده افراد و ادمین‌های هر گروه روی نام آن کلیک کنید:\n\n"
+    
+    now = int(time.time())
+    for g in groups:
+        chat_id, title, owner_id, threshold, last_act = g[0], g[1], g[2], g[3], g[4]
+        days_inactive = int((now - last_act) / 86400)
+        status_icon = "🔴" if days_inactive >= threshold else "🟢"
+        text += f"{status_icon} <b>{html.escape(title)}</b>\n🆔 <code>{chat_id}</code> | خواب: {days_inactive} از {threshold} روز\n\n"
+        markup.add(types.InlineKeyboardButton(f"👥 ادمین‌های {title}", callback_data=f"pv_admins_{chat_id}"))
+
+    markup.add(types.InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="pv_refresh_main"))
+    bot.reply_to(message, text, reply_markup=markup)
 
 @bot.message_handler(commands=['register'])
 def register_group(message):
     if message.from_user.id != SUPER_ADMIN_ID:
-        bot.reply_to(message, "❌ دسترسی غیرمجاز.")
+        bot.reply_to(message, "❌ فقط سوپرادمین اجازه ثبت دارد.")
         return
     chat = message.chat
     if chat.type not in ['group', 'supergroup']:
-        bot.reply_to(message, "❌ این دستور فقط داخل گروه‌ها کار می‌کند.")
+        bot.reply_to(message, "❌ این دستور را باید در داخل گروه ارسال کنید.")
         return
 
     try:
         bm = bot.get_chat_member(chat.id, bot.get_me().id)
         if bm.status != 'administrator' or not bm.can_promote_members or not bm.can_restrict_members:
-            bot.reply_to(message, "❌ ربات باید ادمین با دسترسی کامل (Promote/Restrict) باشد.")
+            bot.reply_to(message, "❌ ربات باید در گروه دسترسی ادمین کامل (Promote & Restrict) داشته باشد.")
             return
     except Exception as e:
-        bot.reply_to(message, f"خطا در بررسی دسترسی‌های ربات: {e}")
+        bot.reply_to(message, f"خطا: {e}")
         return
 
-    owner_id = get_group_owner(chat.id)
-    if not owner_id:
-        owner_id = SUPER_ADMIN_ID  # در صورت عدم تشخیص، موقتاً سوپرادمین
-        owner_note = "\n⚠️ مالک اصلی یافت نشد؛ سوپرادمین موقتاً ثبت شد."
-    else:
-        owner_note = f"\n👑 مالک گروه: <code>{owner_id}</code>"
-
+    owner_id = get_group_owner(chat.id) or SUPER_ADMIN_ID
     add_or_update_group(chat.id, chat.title, owner_id, chat.type)
-    bot.reply_to(message, f"✅ گروه <b>{html.escape(chat.title)}</b> با موفقیت ثبت شد.{owner_note}")
+    bot.reply_to(message, f"✅ گروه <b>{html.escape(chat.title)}</b> با شناسه <code>{chat.id}</code> ثبت شد.\n👑 مالک: <code>{owner_id}</code>")
 
 @bot.message_handler(commands=['protect_admin'])
 def cmd_protect_admin(message):
     if message.from_user.id != SUPER_ADMIN_ID:
         return
-    try:
-        parts = message.text.split()
-        target_id = int(parts[1]) if len(parts) > 1 else (message.reply_to_message.from_user.id if message.reply_to_message else None)
-        if not target_id:
-            raise ValueError()
-        add_protected_admin(message.chat.id, target_id)
-        bot.reply_to(message, f"🛡 ادمین <code>{target_id}</code> به لیست سفید و محافظت‌شده اضافه شد.")
-    except Exception:
-        bot.reply_to(message, "راهنما: <code>/protect_admin USER_ID</code> یا ریپلای روی پیام ادمین.")
+    parts = message.text.split()
+    chat_id = None
+    target_id = None
+
+    if message.chat.type in ['group', 'supergroup']:
+        chat_id = message.chat.id
+        if message.reply_to_message:
+            target_id = message.reply_to_message.from_user.id
+        elif len(parts) > 1:
+            try:
+                target_id = int(parts[1])
+            except ValueError:
+                pass
+    else: # اگر در پی‌وی باشد
+        if len(parts) >= 3:
+            try:
+                chat_id = int(parts[1])
+                target_id = int(parts[2])
+            except ValueError:
+                pass
+
+    if not chat_id or not target_id:
+        bot.reply_to(message, "راهنما:\nدر گروه: <code>/protect_admin USER_ID</code> یا ریپلای روی ادمین\nدر پی‌وی: <code>/protect_admin CHAT_ID USER_ID</code>")
+        return
+
+    add_protected_admin(chat_id, target_id)
+    bot.reply_to(message, f"🛡 کاربر <code>{target_id}</code> در گروه <code>{chat_id}</code> به لیست سفید و محافظت‌شده اضافه شد.")
 
 @bot.message_handler(commands=['unprotect_admin'])
 def cmd_unprotect_admin(message):
     if message.from_user.id != SUPER_ADMIN_ID:
         return
-    try:
-        parts = message.text.split()
-        target_id = int(parts[1]) if len(parts) > 1 else (message.reply_to_message.from_user.id if message.reply_to_message else None)
-        if not target_id:
-            raise ValueError()
-        remove_protected_admin(message.chat.id, target_id)
-        bot.reply_to(message, f"⚠️ ادمین <code>{target_id}</code> از لیست محافظت‌شده خارج شد.")
-    except Exception:
-        bot.reply_to(message, "راهنما: <code>/unprotect_admin USER_ID</code>")
+    parts = message.text.split()
+    chat_id = None
+    target_id = None
 
-@bot.message_handler(commands=['set_threshold'])
-def cmd_set_threshold(message):
-    if message.from_user.id != SUPER_ADMIN_ID:
+    if message.chat.type in ['group', 'supergroup']:
+        chat_id = message.chat.id
+        if message.reply_to_message:
+            target_id = message.reply_to_message.from_user.id
+        elif len(parts) > 1:
+            try:
+                target_id = int(parts[1])
+            except ValueError:
+                pass
+    else:
+        if len(parts) >= 3:
+            try:
+                chat_id = int(parts[1])
+                target_id = int(parts[2])
+            except ValueError:
+                pass
+
+    if not chat_id or not target_id:
+        bot.reply_to(message, "راهنما:\nدر گروه: <code>/unprotect_admin USER_ID</code>\nدر پی‌وی: <code>/unprotect_admin CHAT_ID USER_ID</code>")
         return
-    try:
-        days = int(message.text.split()[1])
-        group = get_group(message.chat.id)
-        if not group:
-            bot.reply_to(message, "❌ ابتدا گروه را با /register ثبت کنید.")
-            return
-        update_group_settings(message.chat.id, days, group[6], group[7], group[8], group[9])
-        bot.reply_to(message, f"✅ آستانه خواب مالک به <b>{days} روز</b> تنظیم شد.")
-    except Exception:
-        bot.reply_to(message, "راهنما: <code>/set_threshold 30</code>")
+
+    remove_protected_admin(chat_id, target_id)
+    bot.reply_to(message, f"⚠️ کاربر <code>{target_id}</code> در گروه <code>{chat_id}</code> از لیست محافظت‌شده حذف شد.")
 
 @bot.message_handler(commands=['remove_admin'])
 def cmd_remove_admin(message):
     if message.from_user.id != SUPER_ADMIN_ID:
         return
+    parts = message.text.split()
+    chat_id = None
     target_id = None
-    if message.reply_to_message:
-        target_id = message.reply_to_message.from_user.id
+
+    if message.chat.type in ['group', 'supergroup']:
+        chat_id = message.chat.id
+        if message.reply_to_message:
+            target_id = message.reply_to_message.from_user.id
+        elif len(parts) > 1:
+            try:
+                target_id = int(parts[1])
+            except ValueError:
+                pass
     else:
-        try:
-            target_id = int(message.text.split()[1])
-        except Exception:
-            bot.reply_to(message, "روی پیام ادمین ریپلای کنید یا: <code>/remove_admin USER_ID</code>")
-            return
-    if demote_admin(message.chat.id, target_id):
-        log_action(message.chat.id, 'manual_demote', message.from_user.id, target_id, "عزل دستی توسط سوپر ادمین")
-        bot.reply_to(message, f"✅ دسترسی‌های ادمین <code>{target_id}</code> سلب شد.")
+        if len(parts) >= 3:
+            try:
+                chat_id = int(parts[1])
+                target_id = int(parts[2])
+            except ValueError:
+                pass
+
+    if not chat_id or not target_id:
+        bot.reply_to(message, "راهنما:\nدر گروه: <code>/remove_admin USER_ID</code> یا ریپلای روی پیام ادمین\nدر پی‌وی: <code>/remove_admin CHAT_ID USER_ID</code>")
+        return
+
+    if demote_admin(chat_id, target_id):
+        log_action(chat_id, 'manual_demote', message.from_user.id, target_id, "عزل دستی توسط ادمین کل")
+        bot.reply_to(message, f"✅ ادمین <code>{target_id}</code> در گروه <code>{chat_id}</code> با موفقیت عزل شد.")
     else:
-        bot.reply_to(message, "❌ خطا در عزل ادمین. دسترسی‌های ربات را بررسی کنید.")
+        bot.reply_to(message, "❌ خطا در عزل ادمین. دسترسی‌های ربات در آن گروه را چک کنید.")
 
 @bot.message_handler(commands=['status'])
 def cmd_status(message):
     if message.from_user.id != SUPER_ADMIN_ID:
         return
-    group = get_group(message.chat.id)
-    if not group:
-        bot.reply_to(message, "گروه در سیستم ثبت نشده است. از /register استفاده کنید.")
+    chat_id = message.chat.id if message.chat.type in ['group', 'supergroup'] else None
+    parts = message.text.split()
+    if len(parts) > 1:
+        try:
+            chat_id = int(parts[1])
+        except ValueError:
+            pass
+
+    if not chat_id:
+        if message.chat.type == 'private':
+            cmd_monitored_list(message)
+            return
+        bot.reply_to(message, "شناسه گروه یافت نشد.")
         return
-    
-    protected = get_protected_admins(message.chat.id)
+
+    group = get_group(chat_id)
+    if not group:
+        bot.reply_to(message, "گروه در سیستم ثبت نشده است.")
+        return
+
+    protected = get_protected_admins(chat_id)
     now = int(time.time())
     days_inactive = int((now - group[4]) / 86400)
-    
+
     text = (
-        f"📊 <b>وضعیت گروه: {html.escape(group[1])}</b>\n\n"
-        f"👑 <b>مالک:</b> <code>{group[2]}</code>\n"
-        f"⏳ <b>آخرین فعالیت مالک:</b> {days_inactive} روز پیش (آستانه: {group[3]} روز)\n"
-        f"🔒 <b>قفل ارتقای ادمین:</b> {'فعال ✅' if group[6] else 'غیرفعال ❌'}\n"
-        f"⚡ <b>محدودیت بن/میوت:</b> {group[7]} بن در {group[9]} دقیقه\n"
-        f"🛡 <b>تعداد ادمین‌های مصون:</b> {len(protected)} نفر"
+        f"📊 <b>وضعیت گروه: {html.escape(group[1])}</b>\n"
+        f"🆔 شناسه گروه: <code>{group[0]}</code>\n"
+        f"👑 شناسه مالک: <code>{group[2]}</code>\n"
+        f"⏳ عدم فعالیت مالک: <b>{days_inactive} روز</b> (آستانه مجاز: {group[3]} روز)\n"
+        f"🔒 قفل ارتقا: {'فعال ✅' if group[6] else 'غیرفعال ❌'}\n"
+        f"🛡 تعداد ادمین‌های مصون: <b>{len(protected)} نفر</b>\n"
+        f"⚡ آستانه بن سریع: {group[7]} بن در {group[9]} دقیقه"
     )
     bot.reply_to(message, text)
 
-@bot.message_handler(commands=['report_admin'])
-def cmd_report_admin(message):
-    if not message.reply_to_message:
-        bot.reply_to(message, "❌ این دستور را روی پیام ادمین خاطی ریپلای کنید.")
-        return
-    target = message.reply_to_message.from_user
-    if target.is_bot:
-        bot.reply_to(message, "❌ امکان گزارش ربات‌ها وجود ندارد.")
-        return
-
-    admins = bot.get_chat_administrators(message.chat.id)
-    if target.id not in [a.user.id for a in admins]:
-        bot.reply_to(message, "❌ کاربر موردنظر در حال حاضر ادمین نیست.")
-        return
-
-    reason = "گزارش ارسال‌شده توسط اعضا"
-    if len(message.text.split()) > 1:
-        reason = message.text.split(maxsplit=1)[1]
-
-    group = get_group(message.chat.id)
-    title = group[1] if group else message.chat.title
-    flag_id = add_flag(message.chat.id, target.id, reason, message.from_user.id)
-    notify_super_admin(message.chat.id, target.id, title, reason, flag_id, auto_demoted=False)
-    bot.reply_to(message, "✅ گزارش شما ثبت شد و برای سوپرادمین ارسال گردید.")
-
 # ---------------------------------------------------------
-# ردگیری فعالیت مالک و اعضا
+# ثبت پیام‌ها برای تشخیص زنده بودن مالک
 # ---------------------------------------------------------
 @bot.message_handler(func=lambda m: True, content_types=['text', 'photo', 'video', 'sticker', 'document', 'voice', 'audio', 'location'])
 def track_owner_activity(message):
+    if message.chat.type not in ['group', 'supergroup']:
+        return
     group = get_group(message.chat.id)
     if not group:
         return
     owner_id = group[2]
-    # اگر پیام از طرف مالک گروه یا کانال متصل باشد
     if message.from_user and message.from_user.id == owner_id:
         update_owner_activity(message.chat.id, int(time.time()))
         if get_pending_warning(message.chat.id):
             clear_pending_warning(message.chat.id)
-            bot.send_message(message.chat.id, "✅ <b>فعالیت مالک گروه تأیید شد.</b> عملیات تعلیق و خلع ادمین‌ها لغو شد.")
+            bot.send_message(message.chat.id, "✅ <b>فعالیت مالک تأیید شد.</b> فرآیند تعلیق و خلع ادمین‌ها لغو شد.")
 
 # ---------------------------------------------------------
-# رصد تغییرات و رفتارهای مشکوک ادمین‌ها (Anti-Raid Core)
+# هندلر رخدادهای اعضا و ادمین‌ها (Anti-Raid Core)
 # ---------------------------------------------------------
 @bot.chat_member_handler()
 def on_chat_member_update(update: types.ChatMemberUpdated):
@@ -533,7 +690,6 @@ def on_chat_member_update(update: types.ChatMemberUpdated):
     new_status = update.new_chat_member.status
     target = update.new_chat_member.user
 
-    # چشم‌پوشی از اقداماتی که کاربر روی خودش انجام داده (مثل لفت دادن)
     if actor.id == target.id:
         return
 
@@ -543,10 +699,9 @@ def on_chat_member_update(update: types.ChatMemberUpdated):
     restrict_thresh = group[8]
     window_min = group[9]
 
-    # ادمین‌های مصون + مالک + سوپرادمین
     whitelist = get_protected_admins(chat_id) + [owner_id, SUPER_ADMIN_ID, bot.get_me().id]
 
-    # 1. بن کردن / اخراج کاربر (Ban Detection)
+    # 1. تشخیص بن مکرر (Mass Ban)
     if new_status in ['kicked', 'banned'] and old_status not in ['kicked', 'banned']:
         log_admin_action(chat_id, actor.id, 'ban', target.id)
         log_action(chat_id, 'ban', actor.id, target.id)
@@ -554,15 +709,14 @@ def on_chat_member_update(update: types.ChatMemberUpdated):
         if actor.id not in whitelist:
             count = count_recent_actions(chat_id, actor.id, 'ban', window_min)
             if count >= ban_thresh:
-                # 💥 مهار فوری خرابکاری (Auto-Demote)
                 demote_admin(chat_id, actor.id)
                 reason = f"بن دسته‌جمعی خودکار ({count} بن در {window_min} دقیقه)"
                 flag_id = add_flag(chat_id, actor.id, reason, 0)
                 log_action(chat_id, 'auto_demote_ban', 0, actor.id, reason)
                 notify_super_admin(chat_id, actor.id, group[1], reason, flag_id, auto_demoted=True)
-                bot.send_message(chat_id, f"🚨 <b>هشدار ضدخرابکاری:</b> دسترسی ادمین <code>{actor.id}</code> به دلیل بن مکرر فوراً سلب شد!")
+                bot.send_message(chat_id, f"🚨 <b>هشدار:</b> دسترسی ادمین <code>{actor.id}</code> به دلیل بن‌های مکرر فوراً لغو شد.")
 
-    # 2. محدودسازی کاربر (Restrict Detection)
+    # 2. تشخیص محدودسازی مکرر (Mass Restrict)
     elif new_status == 'restricted' and old_status != 'restricted':
         log_admin_action(chat_id, actor.id, 'restrict', target.id)
         log_action(chat_id, 'restrict', actor.id, target.id)
@@ -571,100 +725,246 @@ def on_chat_member_update(update: types.ChatMemberUpdated):
             count = count_recent_actions(chat_id, actor.id, 'restrict', window_min)
             if count >= restrict_thresh:
                 demote_admin(chat_id, actor.id)
-                reason = f"محدودسازی دسته‌جمعی خودکار ({count} مورد در {window_min} دقیقه)"
+                reason = f"محدودسازی دسته‌جمعی خودکار ({count} میوت در {window_min} دقیقه)"
                 flag_id = add_flag(chat_id, actor.id, reason, 0)
                 log_action(chat_id, 'auto_demote_restrict', 0, actor.id, reason)
                 notify_super_admin(chat_id, actor.id, group[1], reason, flag_id, auto_demoted=True)
-                bot.send_message(chat_id, f"🚨 <b>هشدار:</b> دسترسی ادمین <code>{actor.id}</code> به دلیل محدودسازی بیش از حد اعضا سلب شد!")
+                bot.send_message(chat_id, f"🚨 <b>هشدار:</b> دسترسی ادمین <code>{actor.id}</code> به دلیل محدودسازی بیش از حد اعضا سلب شد.")
 
-    # 3. ارتقای کاربر به ادمین (Promote Detection & Lock)
+    # 3. قفل ارتقای ادمین (Strict Promote Lock)
     elif new_status == 'administrator' and old_status != 'administrator':
         log_action(chat_id, 'promote', actor.id, target.id)
 
         if strict_lock and actor.id not in whitelist:
-            # عزل فوری هم کاربر جدید و هم ادمین ارتقادهنده
             demote_admin(chat_id, target.id)
             demote_admin(chat_id, actor.id)
-            reason = f"ارتقای غیرمجاز کاربر {target.id} توسط ادمین فاقد صلاحیت {actor.id}"
+            reason = f"ارتقای غیرمجاز کاربر {target.id} توسط ادمین عادی {actor.id}"
             flag_id = add_flag(chat_id, actor.id, reason, 0)
             log_action(chat_id, 'auto_demote_unauthorized_promoter', 0, actor.id, reason)
             notify_super_admin(chat_id, actor.id, group[1], reason, flag_id, auto_demoted=True)
-            bot.send_message(chat_id, "⚠️ <b>قفل ارتقا فعال است:</b> هر دو ادمین خاطی خلع دسترسی شدند.")
+            bot.send_message(chat_id, "⚠️ <b>قفل ارتقا:</b> ادمین‌های غیرمجاز خلع‌ید شدند.")
 
 # ---------------------------------------------------------
-# دکمه‌های شیشه‌ای تلگرام
+# هندلرهای دکمه‌های شیشه‌ای (Callbacks)
 # ---------------------------------------------------------
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callback(call):
     if call.from_user.id != SUPER_ADMIN_ID:
-        bot.answer_callback_query(call.id, "❌ شما دسترسی لازم را ندارید.", show_alert=True)
+        bot.answer_callback_query(call.id, "❌ دسترسی غیرمجاز.", show_alert=True)
         return
 
     data = call.data
     try:
-        if data.startswith('rem_'):
+        # برگشت به منوی اصلی پی‌وی
+        if data == "pv_refresh_main":
+            bot.edit_message_text(
+                "👑 <b>پنل کنترل و پایش مرکزی ربات (مخصوص پی‌وی)</b>\nیک گزینه را انتخاب کنید:",
+                call.message.chat.id, call.message.message_id,
+                reply_markup=get_pv_main_menu()
+            )
+            bot.answer_callback_query(call.id)
+
+        # لیست تمام گروه‌ها برای انتخاب افراد تحت پایش
+        elif data == "pv_monitored_groups" or data == "pv_list_groups":
+            groups = get_all_groups()
+            if not groups:
+                bot.answer_callback_query(call.id, "هیچ گروهی ثبت نشده است!", show_alert=True)
+                return
+
+            markup = types.InlineKeyboardMarkup(row_width=1)
+            text = "👥 <b>انتخاب گروه جهت بررسی افراد تحت پایش و ادمین‌ها:</b>\n\n"
+            now = int(time.time())
+            for g in groups:
+                days_inactive = int((now - g[4]) / 86400)
+                icon = "🔴" if days_inactive >= g[3] else "🟢"
+                text += f"{icon} <b>{html.escape(g[1])}</b> (خواب: {days_inactive} روز)\n"
+                markup.add(types.InlineKeyboardButton(f"⚙️ مدیریت {g[1]}", callback_data=f"pv_detail_{g[0]}"))
+
+            markup.add(types.InlineKeyboardButton("🔙 بازگشت", callback_data="pv_refresh_main"))
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
+            bot.answer_callback_query(call.id)
+
+        # جزییات یک گروه مشخص در پی‌وی
+        elif data.startswith("pv_detail_"):
+            chat_id = int(data.split("_")[2])
+            g = get_group(chat_id)
+            if not g:
+                bot.answer_callback_query(call.id, "گروه یافت نشد!", show_alert=True)
+                return
+
+            now = int(time.time())
+            days_inactive = int((now - g[4]) / 86400)
+            protected_count = len(get_protected_admins(chat_id))
+
+            text = (
+                f"⚙️ <b>مرکز کنترل گروه: {html.escape(g[1])}</b>\n\n"
+                f"🆔 شناسه گروه: <code>{g[0]}</code>\n"
+                f"👑 مالک گروه: <code>{g[2]}</code>\n"
+                f"⏳ آخرین فعالیت مالک: <b>{days_inactive} روز پیش</b> (آستانه: {g[3]} روز)\n"
+                f"🔒 قفل ارتقای ادمین: {'فعال ✅' if g[6] else 'غیرفعال ❌'}\n"
+                f"🛡 تعداد ادمین‌های مصون: <b>{protected_count} نفر</b>\n"
+            )
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=get_pv_group_detail_markup(chat_id))
+            bot.answer_callback_query(call.id)
+
+        # لیست کامل تمام ادمین‌های یک گروه با دکمه‌های اقدام فوری
+        elif data.startswith("pv_admins_"):
+            chat_id = int(data.split("_")[2])
+            g = get_group(chat_id)
+            if not g:
+                bot.answer_callback_query(call.id, "گروه یافت نشد.", show_alert=True)
+                return
+
+            protected = get_protected_admins(chat_id)
+            owner_id = g[2]
+            try:
+                tg_admins = bot.get_chat_administrators(chat_id)
+            except Exception as e:
+                bot.answer_callback_query(call.id, f"خطا در ارتباط با تلگرام: {e}", show_alert=True)
+                return
+
+            bot_id = bot.get_me().id
+            markup = types.InlineKeyboardMarkup(row_width=2)
+            text = f"👥 <b>لیست تمام ادمین‌های گروه: {html.escape(g[1])}</b>\n\n"
+
+            for a in tg_admins:
+                u = a.user
+                if u.id == bot_id:
+                    continue
+                name = html.escape(u.first_name or "ناشناس")
+
+                if a.status == 'creator':
+                    text += f"👑 <b>{name}</b> (<code>{u.id}</code>) - مالک اصلی\n\n"
+                elif u.id in protected:
+                    text += f"🛡 <b>{name}</b> (<code>{u.id}</code>) - [محافظت‌شده ✅]\n\n"
+                    markup.add(
+                        types.InlineKeyboardButton(f"❌ لغو مصونیت {name[:12]}", callback_data=f"pv_unp_{chat_id}_{u.id}"),
+                        types.InlineKeyboardButton(f"🛑 عزل {name[:12]}", callback_data=f"pv_dem_{chat_id}_{u.id}")
+                    )
+                else:
+                    text += f"⚠️ <b>{name}</b> (<code>{u.id}</code>) - [تحت پایش و عادی]\n\n"
+                    markup.add(
+                        types.InlineKeyboardButton(f"🛡 افزودن به سفید {name[:12]}", callback_data=f"pv_prt_{chat_id}_{u.id}"),
+                        types.InlineKeyboardButton(f"🛑 عزل {name[:12]}", callback_data=f"pv_dem_{chat_id}_{u.id}")
+                    )
+
+            markup.add(types.InlineKeyboardButton("🔙 بازگشت به گروه", callback_data=f"pv_detail_{chat_id}"))
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
+            bot.answer_callback_query(call.id)
+
+        # عملیات محافظت / لغو / عزل از منوی ادمین‌ها در پی‌وی
+        elif data.startswith("pv_prt_"):
+            _, _, chat_id, admin_id = data.split("_")
+            add_protected_admin(int(chat_id), int(admin_id))
+            bot.answer_callback_query(call.id, "به لیست سفید اضافه شد! ✅", show_alert=False)
+            # بروزرسانی لیست
+            handle_callback(type('obj', (object,), {'data': f'pv_admins_{chat_id}', 'from_user': call.from_user, 'message': call.message, 'id': call.id}))
+
+        elif data.startswith("pv_unp_"):
+            _, _, chat_id, admin_id = data.split("_")
+            remove_protected_admin(int(chat_id), int(admin_id))
+            bot.answer_callback_query(call.id, "از لیست سفید خارج شد! ⚠️", show_alert=False)
+            handle_callback(type('obj', (object,), {'data': f'pv_admins_{chat_id}', 'from_user': call.from_user, 'message': call.message, 'id': call.id}))
+
+        elif data.startswith("pv_dem_"):
+            _, _, chat_id, admin_id = data.split("_")
+            demote_admin(int(chat_id), int(admin_id))
+            log_action(int(chat_id), 'pv_admin_demote', call.from_user.id, int(admin_id), "عزل از پنل پی‌وی")
+            bot.answer_callback_query(call.id, "ادمین خلع‌ید شد! 🔴", show_alert=True)
+            handle_callback(type('obj', (object,), {'data': f'pv_admins_{chat_id}', 'from_user': call.from_user, 'message': call.message, 'id': call.id}))
+
+        # سوئیچ قفل ارتقای ادمین
+        elif data.startswith("pv_toggle_lock_"):
+            chat_id = int(data.split("_")[3])
+            g = get_group(chat_id)
+            if g:
+                new_lock = not g[6]
+                update_group_settings(chat_id, g[3], new_lock, g[7], g[8], g[9])
+                bot.answer_callback_query(call.id, f"قفل ارتقا: {'فعال شد ✅' if new_lock else 'غیرفعال شد ❌'}")
+                handle_callback(type('obj', (object,), {'data': f'pv_detail_{chat_id}', 'from_user': call.from_user, 'message': call.message, 'id': call.id}))
+
+        # گزارش‌ها و هشدارهای فعال
+        elif data == "pv_active_flags":
+            flags = get_flags('pending')
+            if not flags:
+                bot.answer_callback_query(call.id, "هیچ گزارش و هشدار معلقی وجود ندارد! ✨", show_alert=True)
+                return
+            text = "🚨 <b>هشدارهای امنیتی فعال:</b>\n\n"
+            for f in flags[:10]:
+                text += f"▫️ ادمین <code>{f[2]}</code> در گروه <code>{f[1]}</code>\nعلت: {html.escape(f[3])}\n\n"
+            bot.send_message(call.message.chat.id, text)
+            bot.answer_callback_query(call.id)
+
+        # سایر کلیدها
+        elif data.startswith('rem_'):
             _, chat_id, admin_id, flag_id = data.split('_')
-            chat_id, admin_id, flag_id = int(chat_id), int(admin_id), int(flag_id)
-            demote_admin(chat_id, admin_id)
-            resolve_flag(flag_id, 'removed')
-            log_action(chat_id, 'manual_callback_demote', call.from_user.id, admin_id)
+            demote_admin(int(chat_id), int(admin_id))
+            resolve_flag(int(flag_id), 'removed')
             bot.edit_message_text(f"✅ ادمین <code>{admin_id}</code> با موفقیت عزل شد.", call.message.chat.id, call.message.message_id)
-            bot.send_message(chat_id, "⚠️ یکی از مدیران گروه توسط سوپرادمین عزل شد.")
 
         elif data.startswith('protect_'):
             _, chat_id, admin_id, flag_id = data.split('_')
-            chat_id, admin_id, flag_id = int(chat_id), int(admin_id), int(flag_id)
-            add_protected_admin(chat_id, admin_id)
-            resolve_flag(flag_id, 'whitelisted')
+            add_protected_admin(int(chat_id), int(admin_id))
+            resolve_flag(int(flag_id), 'whitelisted')
             bot.edit_message_text(f"🛡 ادمین <code>{admin_id}</code> به لیست سفید اضافه شد.", call.message.chat.id, call.message.message_id)
 
         elif data.startswith('ign_'):
             flag_id = int(data.split('_')[1])
             resolve_flag(flag_id, 'ignored')
-            bot.edit_message_text("✅ گزارش نادیده گرفته و مختومه شد.", call.message.chat.id, call.message.message_id)
+            bot.edit_message_text("✅ گزارش مختومه شد.", call.message.chat.id, call.message.message_id)
 
     except Exception as e:
+        logging.error(f"Callback error: {e}")
         bot.answer_callback_query(call.id, f"خطا: {e}", show_alert=True)
 
 # ---------------------------------------------------------
-# روت‌های وب و کران جاب
+# روت‌های وب (Flask Endpoints سازگار با Vercel)
 # ---------------------------------------------------------
-@app.route('/api/webhook', methods=['POST'])
-def webhook():
-    if request.headers.get('content-type') == 'application/json':
-        json_str = request.get_data().decode('utf-8')
-        update = types.Update.de_json(json_str)
-        bot.process_new_updates([update])
-        return 'OK', 200
-    return 'Bad Request', 400
+@app.route('/', defaults={'path': ''}, methods=['GET', 'POST'])
+@app.route('/<path:path>', methods=['GET', 'POST'])
+def catch_all(path):
+    # دریافت وب‌هوک تلگرام
+    if path in ['api/webhook', 'webhook', 'api/index']:
+        if request.method == 'POST' and request.headers.get('content-type') == 'application/json':
+            json_str = request.get_data().decode('utf-8')
+            update = types.Update.de_json(json_str)
+            bot.process_new_updates([update])
+            return 'OK', 200
+        return 'Webhook is active', 200
 
-@app.route('/api/cron', methods=['GET'])
-def cron_check():
-    secret = request.args.get('secret', '')
-    if not hmac.compare_digest(secret, CRON_SECRET):
-        return 'Forbidden', 403
+    # کران جاب
+    if path in ['api/cron', 'cron']:
+        secret = request.args.get('secret', '')
+        if not hmac.compare_digest(secret, CRON_SECRET):
+            return 'Forbidden', 403
 
-    now = int(time.time())
-    for g in get_all_groups():
-        chat_id, title, owner_id, threshold, last_activity, chat_type, _ = g
-        days_inactive = (now - last_activity) / 86400
+        now = int(time.time())
+        for g in get_all_groups():
+            chat_id, title, owner_id, threshold, last_activity = g[0], g[1], g[2], g[3], g[4]
+            days_inactive = (now - last_activity) / 86400
 
-        if days_inactive >= threshold:
-            warned_at = get_pending_warning(chat_id)
-            if not warned_at:
-                set_pending_warning(chat_id, now)
-                try:
-                    bot.send_message(chat_id, WARNING_MESSAGE)
-                except Exception as e:
-                    logging.error(f"Error sending warning to {chat_id}: {e}")
-            elif now - warned_at >= 86400: # پس از گذشت ۲۴ ساعت از هشدار
-                purge_unprotected_admins(chat_id)
-                clear_pending_warning(chat_id)
+            if days_inactive >= threshold:
+                warned_at = get_pending_warning(chat_id)
+                if not warned_at:
+                    set_pending_warning(chat_id, now)
+                    try:
+                        bot.send_message(chat_id, WARNING_MESSAGE)
+                    except Exception:
+                        pass
+                elif now - warned_at >= 86400:
+                    purge_unprotected_admins(chat_id)
+                    clear_pending_warning(chat_id)
+        return 'Cron OK', 200
 
-    return 'Cron Finished Successfully', 200
+    # در صورت باز شدن ریشه توسط مرورگر
+    if path == '' and request.method == 'GET':
+        if not session.get('logged_in'):
+            return redirect(url_for('login'))
+        return redirect(url_for('dashboard'))
+
+    return 'Not Found', 404
 
 def purge_unprotected_admins(chat_id):
-    """عزل تمام ادمین‌های غیرمحافظت‌شده به دلیل عدم فعالیت مالک"""
     group = get_group(chat_id)
     if not group:
         return
@@ -672,8 +972,7 @@ def purge_unprotected_admins(chat_id):
     protected = get_protected_admins(chat_id) + [owner_id, SUPER_ADMIN_ID, bot.get_me().id]
     try:
         admins = bot.get_chat_administrators(chat_id)
-    except Exception as e:
-        logging.error(f"Cannot get admins for {chat_id}: {e}")
+    except Exception:
         return
 
     removed = []
@@ -682,13 +981,13 @@ def purge_unprotected_admins(chat_id):
             continue
         if demote_admin(chat_id, admin.user.id):
             removed.append(admin.user.id)
-            log_action(chat_id, 'inactivity_purge', 0, admin.user.id, "حذف به دلیل خواب مالک گروه")
+            log_action(chat_id, 'inactivity_purge', 0, admin.user.id, "حذف به دلیل عدم فعالیت مالک")
 
     if removed:
-        bot.send_message(chat_id, f"🛡 <b>عملیات پاکسازی امنیتی:</b> تعداد {len(removed)} ادمین به دلیل عدم حضور مالک عزل شدند.")
+        bot.send_message(chat_id, f"🛡 <b>پاکسازی امنیتی:</b> تعداد {len(removed)} ادمین به دلیل عدم حضور مالک عزل شدند.")
 
 # ---------------------------------------------------------
-# پنل تحت وب (Flask Dashboard)
+# داشبورد وب (Web Panel)
 # ---------------------------------------------------------
 def login_required(f):
     @wraps(f)
@@ -698,146 +997,74 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
-BASE_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="fa" dir="rtl">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{{ title }} | پنل امنیت گروه</title>
-    <style>
-        * { box-sizing: border-box; font-family: 'Segoe UI', Tahoma, sans-serif; }
-        body { background: #f0f2f5; margin: 0; padding: 0; color: #333; }
-        nav { background: #1e293b; padding: 15px 30px; display: flex; justify-content: space-between; align-items: center; }
-        nav a { color: #f8fafc; text-decoration: none; margin-left: 20px; font-weight: 500; }
-        nav a:hover { color: #38bdf8; }
-        .container { max-width: 1100px; margin: 30px auto; background: #fff; padding: 30px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); }
-        h1, h2 { color: #0f172a; margin-top: 0; }
-        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
-        th, td { padding: 12px 15px; text-align: right; border-bottom: 1px solid #e2e8f0; }
-        th { background: #f8fafc; color: #475569; font-weight: 600; }
-        .badge { padding: 5px 10px; border-radius: 20px; font-size: 13px; font-weight: bold; }
-        .badge-green { background: #dcfce7; color: #15803d; }
-        .badge-red { background: #fee2e2; color: #b91c1c; }
-        .badge-blue { background: #e0f2fe; color: #0369a1; }
-        .btn { padding: 8px 16px; border: none; border-radius: 6px; cursor: pointer; text-decoration: none; display: inline-block; font-size: 14px; font-weight: 500; }
-        .btn-blue { background: #0284c7; color: #fff; }
-        .btn-red { background: #ef4444; color: #fff; }
-        .btn-green { background: #22c55e; color: #fff; }
-        .btn:hover { opacity: 0.9; }
-        input, select { padding: 9px 12px; border: 1px solid #cbd5e1; border-radius: 6px; margin: 5px 0; width: 100%; max-width: 300px; }
-        .form-inline { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 20px; }
-        .card { background: #f8fafc; border: 1px solid #e2e8f0; padding: 20px; border-radius: 8px; margin-bottom: 25px; }
-    </style>
-</head>
-<body>
-    {% if session.get('logged_in') %}
-    <nav>
-        <div>
-            <a href="{{ url_for('dashboard') }}">📊 داشبورد گروه‌ها</a>
-            <a href="{{ url_for('flags_page') }}">🚨 گزارش‌ها و تخلفات</a>
-        </div>
-        <div>
-            <a href="{{ url_for('logout') }}" style="color: #f87171;">خروج 🚪</a>
-        </div>
-    </nav>
-    {% endif %}
-    <div class="container">
-        {% block content %}{% endblock %}
-    </div>
-</body>
-</html>
+STYLE = """
+<style>
+* { box-sizing: border-box; font-family: Tahoma, sans-serif; }
+body { background: #f1f5f9; margin: 0; padding: 0; direction: rtl; color: #1e293b; }
+nav { background: #0f172a; padding: 15px 30px; display: flex; justify-content: space-between; }
+nav a { color: #fff; text-decoration: none; margin-left: 20px; font-size: 14px; }
+.container { max-width: 1000px; margin: 30px auto; background: #fff; padding: 25px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }
+table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+th, td { padding: 10px 14px; border-bottom: 1px solid #e2e8f0; text-align: right; }
+th { background: #f8fafc; color: #475569; }
+.btn { padding: 6px 12px; border: none; border-radius: 5px; cursor: pointer; color: #fff; text-decoration: none; font-size: 13px; display: inline-block; }
+.btn-blue { background: #0284c7; }
+.btn-red { background: #ef4444; }
+.btn-green { background: #16a34a; }
+.badge { padding: 4px 8px; border-radius: 12px; font-size: 12px; color: #fff; }
+.bg-red { background: #ef4444; }
+.bg-green { background: #16a34a; }
+input { padding: 8px; border: 1px solid #cbd5e1; border-radius: 5px; }
+</style>
 """
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
-    error = None
+    err = ""
     if request.method == 'POST':
-        pwd = request.form.get('password', '')
-        if hmac.compare_digest(pwd, PANEL_PASSWORD):
+        if hmac.compare_digest(request.form.get('password', ''), PANEL_PASSWORD):
             session['logged_in'] = True
             return redirect(url_for('dashboard'))
-        error = "رمز عبور نادرست است."
-
-    template = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', """
-    <div style="max-width: 380px; margin: 50px auto; text-align: center;">
-        <h2>ورود به پنل مدیریت امنیت</h2>
-        {% if error %}<p style="color: red;">{{ error }}</p>{% endif %}
+        err = "رمز عبور نادرست است."
+    return render_template_string(STYLE + f"""
+    <div class="container" style="max-width: 350px; margin-top: 80px; text-align: center;">
+        <h2>ورود به پنل مدیریت</h2>
+        {'<p style="color:red">'+err+'</p>' if err else ''}
         <form method="post">
-            <input type="password" name="password" placeholder="رمز پنل..." required><br><br>
-            <button class="btn btn-blue" style="width: 100%;">ورود به سیستم</button>
+            <input type="password" name="password" placeholder="رمز پنل..." required style="width: 100%; margin-bottom: 15px;"><br>
+            <button class="btn btn-blue" style="width: 100%; padding: 10px;">ورود</button>
         </form>
     </div>
     """)
-    return render_template_string(template, title="ورود", error=error)
 
 @app.route('/logout')
 def logout():
     session.clear()
     return redirect(url_for('login'))
 
-@app.route('/')
+@app.route('/dashboard')
 @login_required
 def dashboard():
     groups = get_all_groups()
     now = int(time.time())
-    processed_groups = []
+    rows = ""
     for g in groups:
-        chat_id, title, owner_id, threshold, last_activity, chat_type, strict = g
-        days_inactive = int((now - last_activity) / 86400)
-        processed_groups.append({
-            'chat_id': chat_id,
-            'title': title,
-            'owner_id': owner_id,
-            'threshold': threshold,
-            'days_inactive': days_inactive,
-            'is_warned': days_inactive >= threshold,
-            'strict': strict
-        })
+        days = int((now - g[4]) / 86400)
+        badge = f'<span class="badge bg-red">{days} روز خواب</span>' if days >= g[3] else f'<span class="badge bg-green">{days} روز (فعال)</span>'
+        rows += f"<tr><td><b>{html.escape(g[1])}</b></td><td><code>{g[2]}</code></td><td>{badge}</td><td><a href='/group/{g[0]}' class='btn btn-blue'>مدیریت</a></td></tr>"
 
-    content = """
-    <h1>داشبورد مدیریت امنیت گروه‌ها</h1>
-    <table>
-        <thead>
-            <tr>
-                <th>نام گروه</th>
-                <th>مالک</th>
-                <th>وضعیت فعالیت مالک</th>
-                <th>قفل ارتقا</th>
-                <th>عملیات</th>
-            </tr>
-        </thead>
-        <tbody>
-            {% for g in groups %}
-            <tr>
-                <td><b>{{ g.title }}</b></td>
-                <td><code>{{ g.owner_id }}</code></td>
-                <td>
-                    {% if g.is_warned %}
-                        <span class="badge badge-red">⚠️ غیرفعال ({{ g.days_inactive }} روز)</span>
-                    {% else %}
-                        <span class="badge badge-green">فعال ({{ g.days_inactive }} روز پیش)</span>
-                    {% endif %}
-                </td>
-                <td>
-                    {% if g.strict %}
-                        <span class="badge badge-blue">فعال ✅</span>
-                    {% else %}
-                        <span class="badge badge-red">غیرفعال ❌</span>
-                    {% endif %}
-                </td>
-                <td>
-                    <a href="{{ url_for('group_detail', chat_id=g.chat_id) }}" class="btn btn-blue">مدیریت و تنظیمات</a>
-                </td>
-            </tr>
-            {% else %}
-            <tr><td colspan="5" style="text-align: center;">هیچ گروهی ثبت نشده است. از ربات تلگرام /register استفاده کنید.</td></tr>
-            {% endfor %}
-        </tbody>
-    </table>
+    html_content = f"""
+    {STYLE}
+    <nav><div><a href="/dashboard">📊 داشبورد</a><a href="/flags">🚨 گزارش‌ها</a></div><div><a href="/logout" style="color:#f87171;">خروج</a></div></nav>
+    <div class="container">
+        <h2>📊 وضعیت گروه‌های تحت نظارت</h2>
+        <table>
+            <tr><th>نام گروه</th><th>مالک</th><th>وضعیت</th><th>عملیات</th></tr>
+            {rows or '<tr><td colspan="4" style="text-align:center;">هیچ گروهی ثبت نشده است.</td></tr>'}
+        </table>
+    </div>
     """
-    template = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', content)
-    return render_template_string(template, title="داشبورد", groups=processed_groups)
+    return html_content
 
 @app.route('/group/<int:chat_id>')
 @login_required
@@ -848,250 +1075,70 @@ def group_detail(chat_id):
 
     protected = get_protected_admins(chat_id)
     try:
-        tg_admins = bot.get_chat_administrators(chat_id)
+        admins = bot.get_chat_administrators(chat_id)
     except Exception:
-        tg_admins = []
+        admins = []
 
-    admin_list = []
-    bot_id = bot.get_me().id
-    for a in tg_admins:
-        if a.user.id == bot_id:
+    admin_rows = ""
+    for a in admins:
+        if a.user.id == bot.get_me().id:
             continue
-        admin_list.append({
-            'id': a.user.id,
-            'name': a.user.first_name,
-            'is_creator': (a.status == 'creator'),
-            'is_protected': (a.user.id in protected)
-        })
+        if a.status == 'creator':
+            admin_rows += f"<tr><td>👑 {html.escape(a.user.first_name)}</td><td><code>{a.user.id}</code></td><td>مالک</td><td>-</td></tr>"
+            continue
+        is_p = a.user.id in protected
+        btn_prot = f"<form method='post' action='/group/{chat_id}/toggle_p/{a.user.id}' style='display:inline;'><button class='btn {'btn-green' if is_p else 'btn-blue'}'>{'محافظت‌شده ✅' if is_p else 'محافظت 🛡'}</button></form>"
+        btn_demote = f"<form method='post' action='/group/{chat_id}/demote/{a.user.id}' onsubmit='return confirm(\"عزل شود؟\");' style='display:inline;'><button class='btn btn-red'>عزل ❌</button></form>"
+        admin_rows += f"<tr><td>{html.escape(a.user.first_name)}</td><td><code>{a.user.id}</code></td><td>{btn_prot}</td><td>{btn_demote}</td></tr>"
 
-    logs = get_action_log(chat_id, limit=25)
-    formatted_logs = []
-    for l in logs:
-        action, actor, target, details, ts = l
-        formatted_logs.append({
-            'action': action,
-            'actor': actor,
-            'target': target,
-            'details': details or '-',
-            'time': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts))
-        })
-
-    content = """
-    <h2>⚙️ مدیریت گروه: {{ group[1] }}</h2>
-    
-    <div class="card">
-        <h3>تنظیمات ضد خرابکاری و قوانین گروه</h3>
-        <form method="post" action="{{ url_for('update_group_cfg', chat_id=group[0]) }}">
-            <div class="form-inline">
-                <div>
-                    <label>آستانه خواب مالک (روز):</label><br>
-                    <input type="number" name="threshold_days" value="{{ group[3] }}" required>
-                </div>
-                <div>
-                    <label>حداکثر بن در بازه:</label><br>
-                    <input type="number" name="ban_threshold" value="{{ group[7] }}" required>
-                </div>
-                <div>
-                    <label>حداکثر میوت در بازه:</label><br>
-                    <input type="number" name="restrict_threshold" value="{{ group[8] }}" required>
-                </div>
-                <div>
-                    <label>بازه زمانی بررسی (دقیقه):</label><br>
-                    <input type="number" name="window_minutes" value="{{ group[9] }}" required>
-                </div>
-            </div>
-            <div>
-                <label>
-                    <input type="checkbox" name="strict_promote_lock" value="1" {% if group[6] %}checked{% endif %} style="width: auto;">
-                    قفل اکید ارتقای ادمین (فقط مالک و لیست سفید حق ادمین کردن دارند)
-                </label>
-            </div>
-            <br>
-            <button class="btn btn-blue">💾 ذخیره تغییرات</button>
-        </form>
+    return render_template_string(STYLE + f"""
+    <nav><div><a href="/dashboard">📊 داشبورد</a></div><div><a href="/logout">خروج</a></div></nav>
+    <div class="container">
+        <h2>مدیریت گروه: {html.escape(group[1])}</h2>
+        <h3>👥 لیست ادمین‌ها</h3>
+        <table><tr><th>نام ادمین</th><th>شناسه</th><th>حفاظت</th><th>عملیات</th></tr>{admin_rows}</table>
     </div>
+    """)
 
-    <h3>👥 لیست ادمین‌ها و سطوح دسترسی</h3>
-    <table>
-        <thead>
-            <tr>
-                <th>نام و مشخصات</th>
-                <th>شناسه (ID)</th>
-                <th>نقش / وضعیت</th>
-                <th>حفاظت (لیست سفید)</th>
-                <th>اقدام فوری</th>
-            </tr>
-        </thead>
-        <tbody>
-            {% for a in admins %}
-            <tr>
-                <td><b>{{ a.name }}</b></td>
-                <td><code>{{ a.id }}</code></td>
-                <td>
-                    {% if a.is_creator %}
-                        <span class="badge badge-blue">مالک اصلی 👑</span>
-                    {% else %}
-                        مدیر
-                    {% endif %}
-                </td>
-                <td>
-                    {% if not a.is_creator %}
-                        {% if a.is_protected %}
-                            <form method="post" action="{{ url_for('toggle_protect', chat_id=group[0], admin_id=a.id, action='unprotect') }}" style="display:inline;">
-                                <button class="btn btn-green">محافظت‌شده ✅</button>
-                            </form>
-                        {% else %}
-                            <form method="post" action="{{ url_for('toggle_protect', chat_id=group[0], admin_id=a.id, action='protect') }}" style="display:inline;">
-                                <button class="btn btn-blue">عادی (حفاظت نشده)</button>
-                            </form>
-                        {% endif %}
-                    {% else %}
-                        -
-                    {% endif %}
-                </td>
-                <td>
-                    {% if not a.is_creator %}
-                    <form method="post" action="{{ url_for('demote_admin_web', chat_id=group[0], admin_id=a.id) }}" onsubmit="return confirm('آیا از عزل این ادمین مطمئن هستید؟');" style="display:inline;">
-                        <button class="btn btn-red">عزل ادمین ❌</button>
-                    </form>
-                    {% endif %}
-                </td>
-            </tr>
-            {% endfor %}
-        </tbody>
-    </table>
-
-    <h3 style="margin-top: 40px;">📜 لاگ رویدادها و فعالیت‌های اخیر</h3>
-    <table>
-        <thead>
-            <tr>
-                <th>عملیات</th>
-                <th>مجری</th>
-                <th>هدف</th>
-                <th>توضیحات</th>
-                <th>زمان</th>
-            </tr>
-        </thead>
-        <tbody>
-            {% for l in logs %}
-            <tr>
-                <td><code>{{ l.action }}</code></td>
-                <td><code>{{ l.actor }}</code></td>
-                <td><code>{{ l.target }}</code></td>
-                <td>{{ l.details }}</td>
-                <td>{{ l.time }}</td>
-            </tr>
-            {% else %}
-            <tr><td colspan="5" style="text-align:center;">هیچ لاگی ثبت نشده است.</td></tr>
-            {% endfor %}
-        </tbody>
-    </table>
-    """
-    template = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', content)
-    return render_template_string(template, title=f"مدیریت {group[1]}", group=group, admins=admin_list, logs=formatted_logs)
-
-@app.route('/group/<int:chat_id>/config', methods=['POST'])
+@app.route('/group/<int:chat_id>/toggle_p/<int:admin_id>', methods=['POST'])
 @login_required
-def update_group_cfg(chat_id):
-    threshold_days = int(request.form.get('threshold_days', 30))
-    ban_thresh = int(request.form.get('ban_threshold', 5))
-    restrict_thresh = int(request.form.get('restrict_threshold', 8))
-    window_min = int(request.form.get('window_minutes', 5))
-    strict_promote = bool(request.form.get('strict_promote_lock'))
-
-    update_group_settings(chat_id, threshold_days, strict_promote, ban_thresh, restrict_thresh, window_min)
-    return redirect(url_for('group_detail', chat_id=chat_id))
-
-@app.route('/group/<int:chat_id>/protect_toggle/<int:admin_id>/<action>', methods=['POST'])
-@login_required
-def toggle_protect(chat_id, admin_id, action):
-    if action == 'protect':
-        add_protected_admin(chat_id, admin_id)
-    else:
+def toggle_protection_web(chat_id, admin_id):
+    if admin_id in get_protected_admins(chat_id):
         remove_protected_admin(chat_id, admin_id)
-    return redirect(url_for('group_detail', chat_id=chat_id))
+    else:
+        add_protected_admin(chat_id, admin_id)
+    return redirect(f"/group/{chat_id}")
 
 @app.route('/group/<int:chat_id>/demote/<int:admin_id>', methods=['POST'])
 @login_required
-def demote_admin_web(chat_id, admin_id):
-    if demote_admin(chat_id, admin_id):
-        log_action(chat_id, 'panel_demote', 0, admin_id, "عزل دستی از طریق پنل وب")
-        try:
-            bot.send_message(chat_id, f"⚠️ دسترسی ادمین <code>{admin_id}</code> از طریق پنل مدیریت سلب شد.")
-        except Exception:
-            pass
-    return redirect(url_for('group_detail', chat_id=chat_id))
+def demote_web(chat_id, admin_id):
+    demote_admin(chat_id, admin_id)
+    log_action(chat_id, 'web_demote', 0, admin_id)
+    return redirect(f"/group/{chat_id}")
 
 @app.route('/flags')
 @login_required
-def flags_page():
-    raw_flags = get_flags('pending')
-    flags = []
-    for f in raw_flags:
-        fid, chat_id, admin_id, reason, reported_by, status, ts = f
-        group = get_group(chat_id)
-        flags.append({
-            'id': fid,
-            'chat_id': chat_id,
-            'group_title': group[1] if group else str(chat_id),
-            'admin_id': admin_id,
-            'reason': reason,
-            'time': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts))
-        })
+def flags_view():
+    flags = get_flags('pending')
+    rows = ""
+    for f in flags:
+        rows += f"<tr><td>{f[1]}</td><td>{f[2]}</td><td>{html.escape(f[3])}</td><td><form method='post' action='/flags/{f[0]}/resolve' style='display:inline;'><button class='btn btn-green'>بستن ✅</button></form></td></tr>"
+    return render_template_string(STYLE + f"""
+    <nav><div><a href="/dashboard">📊 داشبورد</a><a href="/flags">🚨 گزارش‌ها</a></div><div><a href="/logout">خروج</a></div></nav>
+    <div class="container">
+        <h2>🚨 گزارش‌های بررسی‌نشده</h2>
+        <table><tr><th>گروه</th><th>ادمین</th><th>علت</th><th>عملیات</th></tr>{rows or '<tr><td colspan="4" style="text-align:center;">هیچ گزارشی وجود ندارد.</td></tr>'}</table>
+    </div>
+    """)
 
-    content = """
-    <h2>🚨 گزارش‌ها و هشدارهای امنیتی بررسی‌نشده</h2>
-    <table>
-        <thead>
-            <tr>
-                <th>گروه</th>
-                <th>ادمین خاطی</th>
-                <th>علت تخلف</th>
-                <th>زمان</th>
-                <th>عملیات</th>
-            </tr>
-        </thead>
-        <tbody>
-            {% for f in flags %}
-            <tr>
-                <td><b>{{ f.group_title }}</b></td>
-                <td><code>{{ f.admin_id }}</code></td>
-                <td><span style="color: #b91c1c;">{{ f.reason }}</span></td>
-                <td>{{ f.time }}</td>
-                <td>
-                    <form method="post" action="{{ url_for('resolve_flag_web', flag_id=f.id, act='demote') }}" style="display:inline;">
-                        <button class="btn btn-red">عزل ادمین ❌</button>
-                    </form>
-                    <form method="post" action="{{ url_for('resolve_flag_web', flag_id=f.id, act='ignore') }}" style="display:inline;">
-                        <button class="btn btn-green">نادیده گرفتن ✅</button>
-                    </form>
-                </td>
-            </tr>
-            {% else %}
-            <tr><td colspan="5" style="text-align: center;">هیچ گزارش جدیدی وجود ندارد. همه چیز امن است! ✨</td></tr>
-            {% endfor %}
-        </tbody>
-    </table>
-    """
-    template = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', content)
-    return render_template_string(template, title="گزارش‌ها", flags=flags)
-
-@app.route('/flags/resolve/<int:flag_id>/<act>', methods=['POST'])
+@app.route('/flags/<int:flag_id>/resolve', methods=['POST'])
 @login_required
-def resolve_flag_web(flag_id, act):
-    f = get_flag(flag_id)
-    if f:
-        chat_id, admin_id = f[1], f[2]
-        if act == 'demote':
-            demote_admin(chat_id, admin_id)
-            resolve_flag(flag_id, 'demoted_via_panel')
-            log_action(chat_id, 'flag_demote_panel', 0, admin_id)
-        else:
-            resolve_flag(flag_id, 'ignored_via_panel')
-    return redirect(url_for('flags_page'))
+def resolve_flag_route(flag_id):
+    resolve_flag(flag_id, 'resolved')
+    return redirect('/flags')
 
 # ---------------------------------------------------------
-# راه‌اندازی برنامه
+# راه‌اندازی لوکال
 # ---------------------------------------------------------
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
